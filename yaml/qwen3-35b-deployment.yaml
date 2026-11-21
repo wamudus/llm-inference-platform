@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-35b
+  namespace: llm-serving
+  labels:
+    app: qwen3-35b
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: qwen3-35b
+  template:
+    metadata:
+      labels:
+        app: qwen3-35b
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      runtimeClassName: nvidia
+      terminationGracePeriodSeconds: 30
+
+      # 单 GPU 节点可以删掉这段；多节点集群建议给 GPU 节点打标签后使用 nodeSelector。
+      # nodeSelector:
+      #   gpu: "true"
+      # nodeName: gpu-node-1
+
+      containers:
+        - name: vllm
+          image: docker.io/vllm/vllm-openai:v0.31.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - vllm
+          args:
+            - serve
+            - /models/Qwen3.6-35B-A3B-AWQ
+            - --tensor-parallel-size
+            - "2"
+            - --served-model-name
+            - qwen3-35b
+            # 仅在你信任模型仓库时开启；生产环境建议固定模型 revision。
+            - --trust-remote-code
+            - --enable-auto-tool-choice
+            - --tool-call-parser
+            - qwen3_coder
+            - --reasoning-parser
+            - qwen3
+            - --max-model-len
+            - "131072"
+            - --kv-cache-dtype
+            - fp8
+            - --max-num-seqs
+            - "2"
+            - --max-num-batched-tokens
+            - "8192"
+            - --enable-chunked-prefill
+            - --enable-prefix-caching
+            - --mamba-cache-mode
+            - align
+            # 32GiB 进程内 CPU offload + 可选 SSD 二级缓存。
+            # 需要 vLLM 0.31+；不同版本的 connector 名称可能变化，升级前先验证。
+            - --kv-transfer-config
+            - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":34359738368,"blocks_per_chunk":1,"eviction_policy":"lru","secondary_tiers":[{"type":"fs","root_dir":"/kv_l2","n_read_threads":8,"n_write_threads":4}]}}'
+            - --enable-prompt-tokens-details
+            - --gpu-memory-utilization
+            - "0.93"
+            - --port
+            - "8001"
+          env:
+            - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8001
+              hostPort: 8001
+              protocol: TCP
+          resources:
+            limits:
+              memory: 72Gi
+              nvidia.com/gpu: "2"
+            requests:
+              memory: 8Gi
+              nvidia.com/gpu: "2"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8001
+              scheme: HTTP
+            failureThreshold: 240
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+              scheme: HTTP
+            initialDelaySeconds: 300
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+              scheme: HTTP
+            initialDelaySeconds: 300
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          hostPath:
+            path: /data/models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 40Gi

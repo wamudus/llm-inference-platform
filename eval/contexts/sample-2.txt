@@ -1,0 +1,17 @@
+Synthetic reference — not a real product.
+
+Nimbus N1 and N2 are both dual-socket compute nodes.
+
+N1:
+- 2 × PCIe 5.0 x16
+- 4 × PCIe 5.0 x8
+- 800W power supply
+
+N2:
+- 4 × PCIe 5.0 x16
+- 1200W power supply
+
+Selection notes:
+- If the workload needs four full-width GPUs, choose N2.
+- If the workload needs two GPUs and more x8 expansion, N1 is sufficient.
+- Both nodes support the same CPU and memory configuration.

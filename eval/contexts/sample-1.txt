@@ -1,0 +1,19 @@
+Synthetic reference — not a real product.
+
+Nimbus N1 compute node
+- CPU: 2 × Acme A8 (16C/32T)
+- Memory: 8 × DDR5 RDIMM, max 512GB
+- PCIe: 2 × PCIe 5.0 x16, 4 × PCIe 5.0 x8
+- Network: 2 × 25GbE
+- Storage: 4 × NVMe U.2
+- Power: 800W
+- Operating temperature: 0–40°C
+
+Nimbus N2 compute node
+- CPU: 2 × Acme A8 (16C/32T)
+- Memory: 8 × DDR5 RDIMM, max 512GB
+- PCIe: 4 × PCIe 5.0 x16
+- Network: 2 × 25GbE
+- Storage: 8 × NVMe U.2
+- Power: 1200W
+- Operating temperature: 0–40°C

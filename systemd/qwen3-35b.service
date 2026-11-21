@@ -1,0 +1,30 @@
+[Unit]
+Description=qwen3-35b vLLM deployment (ordered start after NVIDIA device plugin)
+# kubelet/containerd are ordered; apiserver is a static pod managed by kubelet,
+# so manage.sh waits for it at runtime instead of adding a systemd dependency.
+After=kubelet.service containerd.service
+Wants=kubelet.service containerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=KUBECONFIG=/etc/kubernetes/admin.conf
+Environment=REPO_DIR=/opt/llm-inference-platform
+Environment=NAMESPACE=llm-serving
+# Uncomment and set this if node auto-detection is not desirable.
+# Environment=GPU_NODE_NAME=gpu-node-1
+Environment=EXPECTED_GPUS=2
+Environment=DEVICE_PLUGIN_NAMESPACE=kube-system
+Environment=DEVICE_PLUGIN_DS=nvidia-device-plugin
+
+ExecStart=/opt/llm-inference-platform/systemd/manage.sh start
+ExecStop=/opt/llm-inference-platform/systemd/manage.sh stop
+ExecStopPost=/opt/llm-inference-platform/systemd/manage.sh verify-stopped
+
+# start includes apiserver wait (180s) + device plugin wait (300s).
+TimeoutStartSec=900
+TimeoutStopSec=60
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

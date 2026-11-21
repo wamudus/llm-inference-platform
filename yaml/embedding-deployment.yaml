@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embedding
+  namespace: llm-serving
+  labels:
+    app: embedding
+spec:
+  replicas: 1
+  # hostPort 会让 RollingUpdate 的新 Pod 因端口占用 Pending，因此使用 Recreate。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: embedding
+  template:
+    metadata:
+      labels:
+        app: embedding
+    spec:
+      containers:
+        - name: infinity
+          image: michaelf34/infinity:latest
+          # 生产环境建议固定版本/digest；本地已有镜像时避免 registry 抖动。
+          imagePullPolicy: IfNotPresent
+          # 按 numactl --hardware 的实际拓扑修改 CPU 列表。
+          # 示例：把 CPU 推理绑到 GPU 所在的 NUMA 节点。
+          command: ["taskset", "-c", "10-19,30-39", "infinity_emb"]
+          args:
+            - v2
+            - --device
+            - cpu
+            - --model-id
+            - BAAI/bge-m3
+            - --model-id
+            - BAAI/bge-reranker-v2-m3
+            - --port
+            - "7997"
+          env:
+            - name: HF_ENDPOINT
+              value: https://hf-mirror.com
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: ""
+          ports:
+            - name: http
+              containerPort: 7997
+              hostPort: 7997
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "16"
+              memory: 10Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 7997
+            periodSeconds: 10
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 7997
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7997
+            initialDelaySeconds: 2400
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: model-cache
+              mountPath: /app/.cache/huggingface
+      volumes:
+        - name: model-cache
+          hostPath:
+            path: /data/models/infinity
+            type: DirectoryOrCreate

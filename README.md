@@ -11,12 +11,15 @@
 ```text
 Agent / RAG UI
       │
-      ├── knowledge tool ──► embedding / rerank service (:7997)
+      ├── 文档上传 ──► MinerU 解析(:30801) ──► 分片 ──► bge-m3 嵌入 ──► 向量库
+      │
+      ├── knowledge tool ──► infinity 嵌入/重排 (:7997)
       │
       └── OpenAI-compatible API ──► vLLM (:8001)
                                       │
-                                      └── 2× GPU, tensor parallel = 2
+                                      └── 2× GPU (x16), tensor parallel = 2
 
+检索管线 (MinerU + infinity) 共享 1× GPU (x4)，与 vLLM 的 2× x16 隔离
 Prometheus ──► vLLM / embedding / node / GPU exporters
      │
      └── Alertmanager ──► webhook / chat alert
@@ -26,10 +29,12 @@ Prometheus ──► vLLM / embedding / node / GPU exporters
 
 ## 组件
 
-- **推理服务**：vLLM 0.31，Qwen3.6-35B-A3B-AWQ，TP2，FP8 KV，prefix caching
+- **推理服务**：vLLM 0.31，Qwen3.6-35B-A3B-AWQ，TP2，FP8 KV，prefix caching，关闭视觉塔
+- **检索管线**：MinerU 4.0.6 文档解析（PDF→结构化 Markdown）+ infinity（bge-m3 嵌入 + bge-reranker 重排），sidecar 共享一张 GPU
+- **GPU 钉卡**：`NVIDIA_VISIBLE_DEVICES=<UUID>` 声明式分配，绕过设备插件随机分配，重启/换槽不漂移
 - **KV 缓存**：GPU 池 + 32GiB 进程内 CPU offload + 可选 SSD 二级缓存
-- **容器平台**：Kubernetes Deployment，hostNetwork，GPU 独占，startup/readiness/liveness probe
-- **生命周期**：systemd `Type=oneshot + RemainAfterExit`，开机有序拉起、关机摘除、金丝雀 GPU 准入门
+- **容器平台**：Kubernetes Deployment，hostNetwork，startup/readiness/liveness probe
+- **生命周期**：systemd `Type=oneshot + RemainAfterExit`，开机有序拉起、关机摘除、阻塞式 restart、金丝雀 GPU 准入门
 - **可观测性**：Prometheus + Grafana + Alertmanager + 轻量采集器（SQLite 事件库）
 - **评测**：RAG 问答评测脚本与合成样例，支持替换为自己的非敏感数据集
 
@@ -38,15 +43,16 @@ Prometheus ──► vLLM / embedding / node / GPU exporters
 ```text
 llm-inference-platform/
 ├── yaml/
-│   ├── qwen3-35b-deployment.yaml   vLLM 主服务
+│   ├── qwen3-35b-deployment.yaml   vLLM 主服务（NVIDIA_VISIBLE_DEVICES 钉卡）
 │   ├── qwen3-35b-nodeport.yaml     NodePort Service
-│   └── embedding-deployment.yaml   embedding / rerank 服务
+│   └── embedding-deployment.yaml   MinerU + infinity 检索管线（sidecar 共享 GPU）
 ├── systemd/
-│   ├── qwen3-35b.service           生命周期单元
-│   ├── manage.sh                   start / stop / verify 逻辑
+│   ├── platfrom.service            生命周期单元（ExecStart=restart）
+│   ├── platfrom-manage.sh          start / stop / restart / verify 逻辑
 │   └── README.md                   安装与设计说明
 ├── docs/
 │   ├── architecture.md             部署视图 + 请求流
+│   ├── retrieval-pipeline.md       MinerU + infinity 检索管线部署与排错
 │   ├── operations-notes.md         容量、显存、KV、OOM 与缓存经验
 │   └── numa-rerank-tuning.md       NUMA 绑定与重排优化记录
 ├── eval/
@@ -93,9 +99,10 @@ kubectl -n llm-serving get deploy,pod,svc
 ```bash
 sudo mkdir -p /opt/llm-inference-platform
 sudo cp -r yaml systemd docs eval README.md /opt/llm-inference-platform/
-sudo cp systemd/qwen3-35b.service /etc/systemd/system/
+sudo cp systemd/platfrom.service /etc/systemd/system/
+# 如需钉卡，编辑 service 里的 LLM_GPU_UUIDS / EMBED_GPU_UUID
 sudo systemctl daemon-reload
-sudo systemctl enable --now qwen3-35b.service
+sudo systemctl enable --now platfrom.service
 ```
 
 安装说明与设计取舍见 [systemd/README.md](systemd/README.md)。
@@ -109,6 +116,19 @@ python3 eval/run_eval.py eval/questions/sample.jsonl qwen3-35b /tmp/answers.json
 `eval/questions/sample.jsonl` 是合成数据，仅用于演示格式；不要提交真实业务问答。
 
 ## 关键设计
+
+### GPU 钉卡（防漂移）
+
+多 GPU 共享时，设备插件的随机分配会在重启后漂移。本仓库用 `NVIDIA_VISIBLE_DEVICES=<UUID>` 声明式钉卡：
+
+- 走 nvidia container toolkit 注入，**不经过设备插件**，UUID 跟物理卡走，重启/换槽不漂移
+- vLLM 钉 tensor-parallel 卡（`LLM_GPU_UUIDS`），检索管线钉另一张（`EMBED_GPU_UUID`）
+- 用钉卡后**不再声明 `nvidia.com/gpu`**，避免插件把已钉走的卡重复分配
+- `platfrom-manage.sh` 在 apply 时用 `envsubst` 替换 YAML 里的 `${LLM_GPU_UUIDS}` / `${EMBED_GPU_UUID}` 占位符
+
+### 阻塞式 restart
+
+`platfrom-manage.sh restart`（也是 `systemctl restart` 的路径）：`kubectl delete --wait` + 轮询确认旧 Pod 全部终止（GPU 真释放）后才重新 apply，新旧实例永不并存。
 
 ### 显存容量核算
 
@@ -131,6 +151,8 @@ python3 eval/run_eval.py eval/questions/sample.jsonl qwen3-35b /tmp/answers.json
 混合模型的 unified block size 可能不是常见的 16/32，而是由架构推导出的更大值（参考实现为 2096 tokens）。**不足一个 block 的前缀不可缓存**，测试样本必须大于 2 个 block，并以 `usage.prompt_tokens` 实测值为准，不能按字符数估算。
 
 ### NUMA 与重排
+
+> 更新：重排已迁移到 GPU（见 `docs/retrieval-pipeline.md`），检索从 44.6s 降到 0.12s。以下为 CPU 时代的优化记录，仍有参考价值。
 
 embedding / rerank 是 CPU 推理，容易和 vLLM worker 抢 NUMA 本地内存。参考做法：
 

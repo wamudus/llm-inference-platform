@@ -1,0 +1,38 @@
+[Unit]
+Description=platfrom stack (vLLM + embedding) ordered start after NVIDIA device plugin
+# kubelet/containerd are ordered; apiserver is a static pod managed by kubelet,
+# so platfrom-manage.sh waits for it at runtime instead of a systemd dependency.
+After=kubelet.service containerd.service
+Wants=kubelet.service containerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=KUBECONFIG=/etc/kubernetes/admin.conf
+Environment=REPO_DIR=/opt/llm-inference-platform
+Environment=NAMESPACE=llm-serving
+# GPU UUID pinning (drift-free). Find UUIDs with:
+#   nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv
+# LLM gets the tensor-parallel cards (comma-separated), embedding gets the rest.
+# Leave empty to fall back to device-plugin allocation.
+# Environment=LLM_GPU_UUIDS=GPU-xxxx,GPU-yyyy
+# Environment=EMBED_GPU_UUID=GPU-zzzz
+# Uncomment and set this if node auto-detection is not desirable.
+# Environment=GPU_NODE_NAME=gpu-node-1
+Environment=EXPECTED_GPUS=2
+Environment=DEVICE_PLUGIN_NAMESPACE=kube-system
+Environment=DEVICE_PLUGIN_DS=nvidia-device-plugin
+
+# restart is idempotent: it deletes (blocking until pods terminate) then starts,
+# so both boot and `systemctl restart` take the same clean path.
+ExecStart=/opt/llm-inference-platform/systemd/platfrom-manage.sh restart
+ExecStop=/opt/llm-inference-platform/systemd/platfrom-manage.sh stop
+ExecStopPost=/opt/llm-inference-platform/systemd/platfrom-manage.sh verify-stopped
+
+# start includes apiserver wait (180s) + device plugin wait (300s).
+TimeoutStartSec=900
+TimeoutStopSec=300
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

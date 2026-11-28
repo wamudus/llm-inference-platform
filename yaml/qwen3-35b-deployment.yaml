@@ -66,23 +66,33 @@ spec:
             - --enable-prompt-tokens-details
             - --gpu-memory-utilization
             - "0.93"
+            # 纯文本 RAG 场景关闭视觉塔，把显存让给 KV cache（约 +10~30% 池子）。
+            # 需要看图/视频时去掉这行。
+            - --language-model-only
             - --port
             - "8001"
           env:
             - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
               value: "1"
+            # 钉卡（防漂移）：用 GPU UUID 声明，platfrom-manage.sh 在 apply 时替换。
+            # 走 nvidia container toolkit 注入，不经过设备插件的随机分配，重启/换槽不漂移。
+            # 查 UUID：nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "${LLM_GPU_UUIDS}"
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
           ports:
             - name: http
               containerPort: 8001
               hostPort: 8001
               protocol: TCP
           resources:
+            # 用 NVIDIA_VISIBLE_DEVICES 钉卡后不再声明 nvidia.com/gpu，
+            # 避免设备插件把已钉走的卡重复分配；插件 allocatable 仅作参考。
             limits:
               memory: 72Gi
-              nvidia.com/gpu: "2"
             requests:
               memory: 8Gi
-              nvidia.com/gpu: "2"
           startupProbe:
             httpGet:
               path: /health

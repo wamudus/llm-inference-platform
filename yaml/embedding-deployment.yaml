@@ -1,10 +1,17 @@
+# 检索管线：MinerU 解析 + infinity 嵌入/重排，sidecar 共享一张 GPU。
+#
+# 两个容器共享同一张卡（mineru 容器申请 nvidia.com/gpu，infinity 用
+# NVIDIA_VISIBLE_DEVICES 钉同一张卡）。合计显存 ~7GB，单张 16GB 卡足够。
+#
+# MinerU 必须用 4.0.6：DSH dsh-knowledge 插件的 mineru-local 适配器只认
+# 4.0.6 的 /v1/parse/jobs API；4.2.x 改成了 /v1/tasks，插件会 404。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: embedding
+  name: mineru
   namespace: llm-serving
   labels:
-    app: embedding
+    app: mineru
 spec:
   replicas: 1
   # hostPort 会让 RollingUpdate 的新 Pod 因端口占用 Pending，因此使用 Recreate。
@@ -12,24 +19,54 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app: embedding
+      app: mineru
   template:
     metadata:
       labels:
-        app: embedding
+        app: mineru
     spec:
+      runtimeClassName: nvidia
       containers:
+        # ---- MinerU 解析服务（PDF → 结构化 Markdown）----
+        - name: mineru
+          image: docker.io/vllm/vllm-openai:v0.31.0
+          imagePullPolicy: IfNotPresent
+          # venv 由宿主机提供（uv 创建），见 docs/retrieval-pipeline.md。
+          command: ["/data/mineru406-venv/bin/mineru-api"]
+          args: ["--host", "0.0.0.0", "--port", "8000", "--tier", "standard"]
+          env:
+            - name: HF_ENDPOINT
+              value: https://hf-mirror.com
+            # 钉卡：与 infinity 共享同一张卡。UUID 由 platfrom-manage.sh 替换。
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "${EMBED_GPU_UUID}"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+          volumeMounts:
+            - name: mineru-venv
+              mountPath: /data/mineru406-venv
+            - name: uv-python
+              mountPath: /root/.local/share/uv/python
+            - name: mineru-home
+              mountPath: /root/.mineru
+          ports:
+            - name: api
+              containerPort: 8000
+          resources:
+            limits:
+              memory: 16Gi
+            requests:
+              memory: 4Gi
+
+        # ---- infinity 嵌入/重排服务（bge-m3 + bge-reranker-v2-m3）----
         - name: infinity
           image: michaelf34/infinity:latest
-          # 生产环境建议固定版本/digest；本地已有镜像时避免 registry 抖动。
           imagePullPolicy: IfNotPresent
-          # 按 numactl --hardware 的实际拓扑修改 CPU 列表。
-          # 示例：把 CPU 推理绑到 GPU 所在的 NUMA 节点。
-          command: ["taskset", "-c", "10-19,30-39", "infinity_emb"]
+          command: ["infinity_emb"]
           args:
             - v2
             - --device
-            - cpu
+            - cuda
             - --model-id
             - BAAI/bge-m3
             - --model-id
@@ -39,44 +76,57 @@ spec:
           env:
             - name: HF_ENDPOINT
               value: https://hf-mirror.com
+            # 钉同一张卡：插件只把 GPU 注入申请它的 mineru 容器，infinity 必须
+            # 显式声明同一张卡的 UUID，否则会默认看到全部卡并撞上别的负载。
             - name: NVIDIA_VISIBLE_DEVICES
-              value: ""
+              value: "${EMBED_GPU_UUID}"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+          volumeMounts:
+            # infinity 镜像 HF_HOME=/app/.cache/huggingface，缓存必须挂这里。
+            - name: hf-cache
+              mountPath: /app/.cache/huggingface
           ports:
             - name: http
               containerPort: 7997
               hostPort: 7997
           resources:
-            requests:
-              cpu: "2"
-              memory: 4Gi
             limits:
-              cpu: "16"
-              memory: 10Gi
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 7997
-            periodSeconds: 10
-            failureThreshold: 180
+              memory: 12Gi
+            requests:
+              memory: 2Gi
           readinessProbe:
             httpGet:
               path: /health
               port: 7997
             initialDelaySeconds: 30
-            periodSeconds: 10
-            failureThreshold: 12
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 7997
-            initialDelaySeconds: 2400
-            periodSeconds: 30
-            failureThreshold: 5
-          volumeMounts:
-            - name: model-cache
-              mountPath: /app/.cache/huggingface
+            periodSeconds: 15
+            failureThreshold: 40
       volumes:
-        - name: model-cache
+        - name: mineru-venv
           hostPath:
-            path: /data/models/infinity
+            path: /data/mineru406-venv
+        - name: uv-python
+          hostPath:
+            path: /root/.local/share/uv/python
+        - name: mineru-home
+          hostPath:
+            path: /root/.mineru
+        - name: hf-cache
+          hostPath:
+            path: /data/hf-cache
             type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mineru
+  namespace: llm-serving
+spec:
+  type: NodePort
+  selector:
+    app: mineru
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 30801

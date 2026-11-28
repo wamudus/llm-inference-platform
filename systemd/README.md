@@ -12,7 +12,8 @@
 这个单元用 `Type=oneshot + RemainAfterExit=yes` 把“启动/停止”做成一次性编排：
 
 - **stop**：从 etcd 删除 Deployment/Service，避免关机时重建
-- **start**：幂等清理 → 等 apiserver → 等 device plugin → 金丝雀 GPU 准入 → apply
+- **start**：幂等清理 → 等 apiserver → 等 device plugin → 金丝雀 GPU 准入 → 按序 apply（先 vLLM 后 embedding）
+- **restart**：`kubectl delete --wait` + 轮询确认旧 Pod 全部终止（GPU 真释放）后再重新 apply，新旧实例永不并存
 - **canary**：申请 1 张 GPU 的 Pod，`Running` 才说明调度、设备健康、运行时注入都通过
 
 ## 安装
@@ -21,19 +22,29 @@
 kubectl create namespace llm-serving
 sudo mkdir -p /opt/llm-inference-platform
 sudo cp -r yaml systemd docs eval README.md /opt/llm-inference-platform/
-sudo cp systemd/qwen3-35b.service /etc/systemd/system/
+sudo cp systemd/platfrom.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now qwen3-35b.service
+sudo systemctl enable --now platfrom.service
 ```
 
 按你的环境修改：
 
 - `REPO_DIR`：仓库部署路径
 - `NAMESPACE`：默认 `llm-serving`
+- `LLM_GPU_UUIDS` / `EMBED_GPU_UUID`：GPU 钉卡（见下），留空则回退设备插件分配
 - `GPU_NODE_NAME`：留空时自动查找带 `nvidia.com/gpu.present=true` 标签的节点
 - `EXPECTED_GPUS`：默认 2
 - `DEVICE_PLUGIN_NAMESPACE` / `DEVICE_PLUGIN_DS`：默认 `kube-system` / `nvidia-device-plugin`
 - `CANARY_IMAGE`：默认与 vLLM 镜像一致
+
+## GPU 钉卡（防漂移）
+
+多 GPU 共享时设备插件的随机分配会在重启后漂移。用 `NVIDIA_VISIBLE_DEVICES=<UUID>` 钉卡可根治：
+
+- 走 nvidia container toolkit 注入，**不经过设备插件**，UUID 跟物理卡走
+- `LLM_GPU_UUIDS` 给 vLLM（tensor-parallel 卡，逗号分隔），`EMBED_GPU_UUID` 给检索管线
+- 查 UUID：`nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv`
+- 用钉卡后 YAML 里**不再声明 `nvidia.com/gpu`**；`platfrom-manage.sh` 用 `envsubst` 替换占位符
 
 ## 设计取舍
 
@@ -63,8 +74,12 @@ sudo systemctl enable --now qwen3-35b.service
 ## 常用命令
 
 ```bash
-sudo systemctl start qwen3-35b
-sudo systemctl stop qwen3-35b
-sudo systemctl status qwen3-35b
-journalctl -u qwen3-35b -b
+sudo systemctl start platfrom      # 开机/手动拉起（= restart，幂等）
+sudo systemctl stop platfrom       # 停止并摘除
+sudo systemctl restart platfrom    # 阻塞式重启（delete --wait + 确认释放 + 拉起）
+sudo systemctl status platfrom
+journalctl -u platfrom -b
+
+# 或直接用脚本
+/opt/llm-inference-platform/systemd/platfrom-manage.sh start|stop|restart|verify-stopped
 ```
